@@ -1,0 +1,829 @@
+library(caret)
+library(MASS)
+library(e1071)
+library(psych)
+library(corrplot)
+
+#library(car)
+#scatterplotMatrix(ischemic)
+
+#Loading the data set
+ischemic<- read.csv("train_2v2.csv")
+str(ischemic)
+table(ischemic$worktype)
+
+#Eliminating unique id
+ischemic$id <- NULL
+
+#Converting integer values to factor
+ischemic$hypertension <- as.factor(ischemic$hypertension)
+ischemic$heartdisease <- as.factor(ischemic$heartdisease)
+
+#converting the stroke predictor to factor (yes,no). Otherwise, it will show variable.1, such as hypertension.1
+
+ischemic$stroke <- factor(ischemic$stroke, levels = c(0,1),labels=c("No","Yes"))
+ischemic$stroke <- relevel(ischemic$stroke, ref="Yes")
+ischemic$hypertension <- factor(ischemic$hypertension, levels = c(0,1),labels=c("No","Yes"))
+ischemic$heartdisease <- factor(ischemic$heartdisease, levels = c(0,1),labels=c("No","Yes"))
+
+head(ischemic)
+
+
+#Looking for missing values
+#Checking data balance
+prop.table(table(ischemic$gender))
+
+#Age
+age <- table(is.na(ischemic$age))
+age
+prop.table(age)
+
+#Hypertension
+hyper <- table(is.na(ischemic$hypertension))
+hyper
+prop.table(table(ischemic$hypertension))
+
+#heart disease
+h.dis <- table(is.na(ischemic$heartdisease))
+h.dis
+
+#Ever married
+married <- table(is.na(ischemic$evermarried))
+married
+
+#Work type
+table(ischemic$worktype)
+
+#Residence type
+r.type <- table(is.na(ischemic$Residencetype))
+r.type
+
+#Smoking status (factor with 4 leveles, 13292 null values)
+table(ischemic$smokingstatus)
+#checking predictor levels
+levels(ischemic$smokingstatus)
+#assigning new labels
+levels(ischemic$smokingstatus) <- c("Declinedtoanswer", "FormerlySmoked","NeverSmoked", "smokes")
+
+#Glucose level
+is.na(ischemic$avgglucoselevel)
+
+#BmI (1462 missing values)
+table(is.na(ischemic$bmi))
+################################################################################
+
+#Imputation using mice
+library(mice)
+ischemic.d.imp = mice(ischemic , seed =1)
+summary(ischemic.d.imp)
+isc.imp <-complete(ischemic.d.imp,1)
+table(is.na(isc.imp$bmi))
+str(isc.imp)
+
+#DUMMYCODE for train/test set
+default.dmodel <- dummyVars(~ gender+age+hypertension+heartdisease+evermarried+worktype+Residencetype+avgglucoselevel+bmi+smokingstatus, data=isc.imp, fullRank=T)
+isc.imp.d <- as.data.frame(predict(default.dmodel, isc.imp))
+isc.imp.d$stroke <- isc.imp$stroke #copy back DV
+str(isc.imp.d)
+head(isc.imp.d)
+
+#Near 0 variance
+#Calculate Near Zero Variance at 95%
+nzv <- nearZeroVar(isc.imp.d, saveMetrics=T)
+nzv
+isc.imp.d.tmp <- isc.imp.d$stroke
+ischemic.nzv <- isc.imp.d[,!nzv$nzv] #remove gender.Other, heartdisease.yes, worktype.NeverWorked
+ischemic.nzv$stroke <- isc.imp.d.tmp
+isc.imp.d <- ischemic.nzv
+str(isc.imp.d)
+
+#High correlated (correlation plot) - No need to remove
+library(corrplot)
+str(isc.imp.d)
+isc.imp.d.cor <- cor(isc.imp.d[,-14])
+corrplot(isc.imp.d.cor, order="hclust")
+isc.imp.d.cor
+findCorrelation(isc.imp.d.cor, cutoff=.7)
+str(isc.imp.d)
+
+
+#Create Partitioning 70/30 train/test
+isc.imp <- isc.imp.d
+set.seed(1)
+trainIndex <- createDataPartition(isc.imp$stroke, p=.7, list=F)
+isc.train <- isc.imp[trainIndex,]
+isc.test  <-isc.imp[-trainIndex,]
+
+#Cheching output variable data balance/output proportion
+d.table<- table(isc.train$stroke)
+
+prop.table(d.table) # .018% of cases are postive class, high unbalanced data
+
+
+#Balancing with SMOTE
+ischemic.bal.smote <- isc.train
+library(DMwR)
+#hybrid both up and down
+set.seed(9560)
+ischemic.smote <- SMOTE(stroke ~ ., data  = ischemic.bal.smote, perc.over = 4000, perc.under = 101)                    	 
+#comparing balance
+prop.table(table(ischemic.smote$stroke))
+prop.table(table(isc.train$stroke))
+
+#Balancing with ROSE
+ischemic.bal.rose <- isc.train
+str(ischemic.bal.rose)
+library(ROSE)
+set.seed(3)
+ischemic.rose <- ROSE(stroke ~ ., data  = ischemic.bal.rose, seed = 3)$data                    	 
+table(ischemic.rose$stroke)
+str(ischemic.rose)
+ischemic.rose$stroke <- relevel(ischemic.rose$stroke, ref="Yes")
+#comparing balances
+prop.table(table(ischemic.rose$stroke))
+prop.table(table(isc.train$stroke))
+head(ischemic.rose)
+
+str(ischemic.rose)
+str(isc.train)
+#PROBLEM: ROSE changes the type of the predictors from 0/1 to numeric values
+#Solution:changed type of predictors from numeric to factor (hypertension and heart diseasse)
+##############################################################################################
+
+#Checking performances of SMOTE and ROSE with 10 cfv
+library(doParallel)
+
+detectCores(logical = FALSE)
+cl <- makePSOCKcluster(5)
+clusterSetRNGStream(cl, 5672) #set seed for everymember of cluster
+registerDoParallel(cl)
+
+#list number of workers
+getDoParWorkers()
+
+#caret will automatically use cores made available using doParallel package
+ctrl <- trainControl(method = "cv", number=10,
+                 	classProbs = TRUE,
+                 	summaryFunction = twoClassSummary)
+
+
+#LDA
+#Original
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.orig.lda <- train(stroke ~ ., data = isc.train,
+                  	method = "lda",
+                  	metric = "ROC",
+                  	trControl = ctrl)
+isc.orig.lda
+confusionMatrix(predict(isc.orig.lda,isc.test), isc.test$stroke) #original train test
+
+#SMOTE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.smote.lda <- train(stroke ~ ., data = ischemic.smote,
+                   	method = "lda",
+                   	metric = "ROC",
+                   	trControl = ctrl)
+isc.smote.lda
+confusionMatrix(predict(isc.smote.lda,isc.test), isc.test$stroke) #Balanced with SMOTE
+
+#ROSE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.rose.lda <- train(stroke ~ ., data = ischemic.rose,
+                  	method = "lda",
+                  	metric = "ROC",
+                  	trControl = ctrl)
+isc.rose.lda
+confusionMatrix(predict(isc.rose.lda,isc.test), isc.test$stroke) #Balanced with ROSE
+
+#compare the performance of all models trained
+rValues <- resamples(list(orig=isc.orig.lda, SMOTE=isc.smote.lda, ROSE=isc.rose.lda))
+
+#Plotting metrics
+library(gridExtra)
+
+jpeg("CompareBalance_LDA.jpg")
+one <- bwplot(rValues, metric="ROC")  #ROC
+two <- bwplot(rValues, metric="Sens") #Sensitvity
+three <- bwplot(rValues, metric="Spec") #Specificity
+grid.arrange(one,two,three)
+dev.off()
+
+#rpart
+#Original
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.orig.rpart <- train(stroke ~ ., data = isc.train,
+                  	method = "rpart",tuneLength=5,
+                  	metric = "ROC",
+                  	trControl = ctrl)
+confusionMatrix(predict(isc.orig.rpart,isc.test), isc.test$stroke) #original train test
+
+#SMOTE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.smote.rpart <- train(stroke ~ ., data = ischemic.smote,
+                   	method = "rpart",tuneLength=5,
+                   	metric = "ROC",
+                   	trControl = ctrl)
+confusionMatrix(predict(isc.smote.rpart,isc.test), isc.test$stroke) #Balanced with SMOTE
+
+#ROSE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.rose.rpart <- train(stroke ~ ., data = ischemic.rose,
+                  	method = "rpart",tuneLength=5,
+                  	metric = "ROC",
+                  	trControl = ctrl)
+confusionMatrix(predict(isc.rose.rpart,isc.test), isc.test$stroke) #Balanced with ROSE
+
+#compare the performance of all models trained
+rValues2 <- resamples(list(orig=isc.orig.rpart, SMOTE=isc.smote.rpart, ROSE=isc.rose.rpart))
+
+#Plotting metrics
+jpeg("CompareBalance_rpart.jpg")
+one <- bwplot(rValues2, metric="ROC")  #ROC
+two <- bwplot(rValues2, metric="Sens") #Sensitvity
+three <- bwplot(rValues2, metric="Spec") #Specificity
+grid.arrange(one,two,three)
+dev.off()
+
+#GAMSPLINE
+#Original
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.orig.gamSp <- train(stroke ~ ., data = isc.train,
+                  	method = "gamSpline",tuneLength=5,
+                  	metric = "ROC",
+                  	trControl = ctrl)
+confusionMatrix(predict(isc.orig.gamSp,isc.test), isc.test$stroke) #original train test
+
+#SMOTE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.smote.gamSp <- train(stroke ~ ., data = ischemic.smote,
+                   	method = "gamSpline",tuneLength=5,
+                   	metric = "ROC",
+                   	trControl = ctrl)
+confusionMatrix(predict(isc.smote.gamSp,isc.test), isc.test$stroke) #Balanced with SMOTE
+
+#ROSE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.rose.gamSp <- train(stroke ~ ., data = ischemic.rose,
+                  	method = "gamSpline",tuneLength=5,
+                  	metric = "ROC",
+                  	trControl = ctrl)
+confusionMatrix(predict(isc.rose.gamSp,isc.test), isc.test$stroke) #Balanced with ROSE
+
+#compare the performance of all models trained
+rValues3 <- resamples(list(orig=isc.orig.gamSp, SMOTE=isc.smote.gamSp, ROSE=isc.rose.gamSp))
+
+jpeg("CompareBalance_gamSpline.jpg")
+one <- bwplot(rValues3, metric="ROC")  #ROC
+two <- bwplot(rValues3, metric="Sens") #Sensitvity
+three <- bwplot(rValues3, metric="Spec") #Specificity
+grid.arrange(one,two,three)
+dev.off()
+
+#Bagging
+#Original
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.orig.bag <- train(stroke ~ ., data = isc.train,
+                    	method = "treebag",tuneLength=5,
+                    	metric = "ROC",
+                    	trControl = ctrl)
+confusionMatrix(predict(isc.orig.bag,isc.test), isc.test$stroke) #original train test
+
+#SMOTE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.smote.bag <- train(stroke ~ ., data = ischemic.smote,
+                     	method = "treebag",tuneLength=5,
+                     	metric = "ROC",
+                     	trControl = ctrl)
+confusionMatrix(predict(isc.smote.bag,isc.test), isc.test$stroke) #Balanced with SMOTE
+
+#ROSE
+set.seed(5627) #set.seed not completely sufficient when multicore
+isc.rose.bag <- train(stroke ~ ., data = ischemic.rose,
+                    	method = "treebag",tuneLength=5,
+                    	metric = "ROC",
+                    	trControl = ctrl)
+confusionMatrix(predict(isc.rose.bag,isc.test), isc.test$stroke) #Balanced with ROSE
+
+#compare the performance of all models trained
+rValues4 <- resamples(list(orig=isc.orig.bag, SMOTE=isc.smote.bag, ROSE=isc.rose.bag))
+
+jpeg("CompareBalance_bag.jpg")
+one <- bwplot(rValues4, metric="ROC")  #ROC
+two <- bwplot(rValues4, metric="Sens") #Sensitvity
+three <- bwplot(rValues4, metric="Spec") #Specificity
+grid.arrange(one,two,three)
+dev.off()
+
+#compare the performance of all trained models using test dataset
+orig.lda.pred.prob <- predict(isc.orig.lda, isc.test, type="prob")
+orig.rpart.pred.prob <- predict(isc.orig.rpart, isc.test, type="prob")
+orig.gamSp.pred.prob <- predict(isc.orig.gamSp, isc.test, type="prob")
+orig.bag.pred.prob <- predict(isc.orig.bag, isc.test, type="prob")
+
+smote.lda.pred.prob <- predict(isc.smote.lda, isc.test, type="prob")
+smote.rpart.pred.prob <- predict(isc.smote.rpart, isc.test, type="prob")
+smote.gamSp.pred.prob <- predict(isc.smote.gamSp, isc.test, type="prob")
+smote.bag.pred.prob <- predict(isc.smote.bag, isc.test, type="prob")
+
+rose.lda.pred.prob <- predict(isc.rose.lda, isc.test, type="prob")
+rose.rpart.pred.prob <- predict(isc.rose.rpart, isc.test, type="prob")
+rose.gamSp.pred.prob <- predict(isc.rose.gamSp, isc.test, type="prob")
+rose.bag.pred.prob <- predict(isc.rose.bag, isc.test, type="prob")
+library(pROC)
+roc(response= isc.test$stroke, predictor=orig.lda.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=orig.rpart.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=orig.gamSp.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=orig.bag.pred.prob[[1]])$auc
+
+roc(response= isc.test$stroke, predictor=smote.lda.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=smote.rpart.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=smote.gamSp.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=smote.bag.pred.prob[[1]])$auc
+
+roc(response= isc.test$stroke, predictor=rose.lda.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=rose.rpart.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=rose.gamSp.pred.prob[[1]])$auc
+roc(response= isc.test$stroke, predictor=rose.bag.pred.prob[[1]])$auc
+
+####We picked SMOTE
+########################### Modeling
+ctrl <- trainControl(method = "cv", number=10, summaryFunction=twoClassSummary,
+                 	classProbs=T, savePredictions=T)
+##logistic regression
+ischemic.d <- ischemic.smote
+set.seed(199)
+log.train <-  train(stroke ~ ., data=ischemic.d, method="glm", family="binomial", metric="ROC", trControl=ctrl)
+summary(log.train)
+varImp(log.train)
+log.train
+confusionMatrix(log.train$pred$pred, log.train$pred$obs)$byClass[1:2]
+
+
+##linear discriminant analysis
+set.seed(199)
+lda.train <-  train(stroke ~ ., data=ischemic.d, method="lda", metric="ROC", trControl=ctrl)
+lda.train
+varImp(lda.train)
+confusionMatrix(lda.train$pred$pred, lda.train$pred$obs)$byClass[1:2]
+
+
+##quadratic distriminant analysis
+set.seed(199)
+qda.train <-  train(stroke ~ ., data=ischemic.d, method="qda", metric="ROC", trControl=ctrl)
+qda.train
+getTrainPerf(qda.train)
+confusionMatrix(qda.train$pred$pred, qda.train$pred$obs)$byClass[1:2]
+
+#k nearest neighbors classification
+set.seed(199)
+knn.train <-  train(stroke ~ ., data=ischemic.d, method="knn", metric="ROC", trControl=ctrl, tuneLength=10) #let caret decide 10 best parameters to search
+knn.train
+plot(knn.train)
+getTrainPerf(knn.train)
+confusionMatrix(knn.train$pred$pred, knn.train$pred$obs)$byClass[1:2]
+
+
+#GamSpline
+set.seed(199)
+gamSp.train <-  train(stroke ~ ., data=ischemic.d, method="gamSpline", metric="ROC", trControl=ctrl, tuneLength=10) #let caret decide 10 best parameters to search
+gamSp.train
+confusionMatrix(gamSp.train$pred$pred, gamSp.train$pred$obs)$byClass[1:2]
+
+
+#rpart
+set.seed(44)
+tree.train <- train(stroke ~ ., data=ischemic.d,
+                	method="rpart",tuneLength=10,metric = "ROC",
+                	trControl=ctrl)
+tree.train
+confusionMatrix(tree.train$pred$pred, tree.train$pred$obs)$byClass[1:2]
+plot(tree.train$finalModel, uniform=TRUE)
+text(tree.train$finalModel, use.n.=TRUE, all=TRUE, cex=.9, pos=3)
+
+#bagging tree
+set.seed(44)
+bag.train <- train(stroke ~ ., data=ischemic.d,
+               	method="treebag",tuneLength=10,metric = "ROC",
+               	trControl=ctrl)
+bag.train
+confusionMatrix(bag.train$pred$pred, bag.train$pred$obs)$byClass[1:2]
+
+#random forest
+set.seed(44)
+rf.train <- train(stroke ~ ., data=ischemic.d,
+              	method="rf",tuneLength=10, metric = "ROC",
+              	trControl=ctrl)
+rf.train
+confusionMatrix(rf.train$pred$pred, rf.train$pred$obs)$byClass[1:2]
+varImp(rf.train)
+
+#boosting
+set.seed(44)
+boost.train <- train(stroke ~ ., data=ischemic.d,
+                 	method="gbm",tuneLength=10, metric = "ROC",
+                 	trControl=ctrl)
+boost.train
+plot(boost.train$finalModel)
+summary(boost.train)
+confusionMatrix(boost.train$pred$pred, boost.train$pred$obs)$byClass[1:2]
+
+#Neural network
+set.seed(44)
+nn.train <- train(stroke ~ ., trControl = ctrl, data = ischemic.d, metric ='ROC',
+          	method = "nnet") #it runned 10 times, ut you can modify that number
+plot(nn.train) #1,3, and 5 hidden nodes
+getTrainPerf(nn.train)
+nn.train
+#Creating a new grid within range of size (5,10,15) using different decay rate
+nn.grid.train <- expand.grid(size=c(seq(1,13,1)), decay=c(0,.001, .01))
+
+m.nn.grid.train <- train(stroke ~ ., trControl = ctrl, data = ischemic.d, metric ='ROC',
+               	tuneGrid=nn.grid.train, method = "nnet")
+
+m.nn.grid.train
+plot(m.nn.grid.train)
+getTrainPerf(m.nn.grid.train)
+
+#compare the performance of all models trained
+rValues5 <- resamples(list(logit=log.train, lda=lda.train, knn=knn.train, gamSp=gamSp.train, tree=tree.train, bagging=bag.train, randomforest=rf.train, boosting=boost.train, nn=nn.train, nnGrid=m.nn.grid.train))
+
+#Plotting metrics
+bwplot(rValues5, metric="ROC")  #ROC
+bwplot(rValues5, metric="Sens") #Sensitvity
+bwplot(rValues5, metric="Spec") #Specificity
+
+
+
+# Saving roc results for all models
+library(pROC)
+log.train.roc<- roc(response= log.train$pred$obs, predictor=log.train$pred$Yes)
+lda.train.roc<- roc(response= lda.train$pred$obs, predictor=lda.train$pred$Yes)
+qda.train.roc<- roc(response= qda.train$pred$obs, predictor=qda.train$pred$Yes)
+knn.train.roc<- roc(response= knn.train$pred[knn.train$pred$k==5,]$obs, predictor=knn.train$pred[knn.train$pred$k==5,]$Yes)
+gamSp.train.roc<- roc(response= gamSp.train$pred$obs, predictor=gamSp.train$pred$Yes)
+tree.train.roc<- roc(response= tree.train$pred$obs, predictor=tree.train$pred$Yes)
+bag.train.roc<- roc(response= bag.train$pred$obs, predictor=bag.train$pred$Yes)
+rf.train.roc<- roc(response= rf.train$pred$obs, predictor=rf.train$pred$Yes)
+boost.train.roc<- roc(response= boost.train$pred$obs, predictor=boost.train$pred$Yes)
+nn.train.roc<- roc(response= nn.train$pred$obs, predictor=nn.train$pred$Yes)
+m.nn.grid.train.roc<- roc(response=m.nn.grid.train$pred$obs, predictor=m.nn.grid.train$pred$Yes)
+
+
+### TEST DATA PERFORMANCE
+#predict probabilities on test set with All trained models
+log.test.pred.prob <- predict(log.train, isc.test, type="prob")
+log.test.pred.class <- predict(log.train, isc.test) #predict classes with default .5 cutoff
+
+lda.test.pred.prob <- predict(lda.train, isc.test, type="prob")
+lda.test.pred.class <- predict(lda.train, isc.test) #predict classes with default .5 cutoff
+
+qda.test.pred.prob <- predict(qda.train, isc.test, type="prob")
+qda.test.pred.class <- predict(qda.train, isc.test) #predict classes with default .5 cutoff
+
+knn.test.pred.prob <- predict(knn.train, isc.test, type="prob")
+knn.test.pred.class <- predict(knn.train, isc.test) #predict classes with default .5 cutoff
+
+gamSp.test.pred.prob <- predict(gamSp.train, isc.test, type="prob")
+gamSp.test.pred.class <- predict(gamSp.train, isc.test) #predict classes with default .5 cutoff
+
+tree.test.pred.prob <- predict(tree.train, isc.test, type="prob")
+tree.test.pred.class <- predict(tree.train, isc.test) #predict classes with default .5 cutoff
+
+bag.test.pred.prob <- predict(bag.train, isc.test, type="prob")
+bag.test.pred.class <- predict(bag.train, isc.test) #predict classes with default .5 cutoff
+
+rf.test.pred.prob <- predict(rf.train, isc.test, type="prob")
+rf.test.pred.class <- predict(rf.train, isc.test) #predict classes with default .5 cutoff
+
+boost.test.pred.prob <- predict(boost.train, isc.test, type="prob")
+boost.test.pred.class <- predict(boost.train, isc.test) #predict classes with default .5 cutoff
+
+nn.test.pred.prob <- predict(nn.train, isc.test, type="prob")
+nn.test.pred.class <- predict(nn.train, isc.test) #predict classes with default .5 cutoff
+
+m.nn.grid.test.pred.prob <- predict(m.nn.grid.train, isc.test, type="prob")
+m.nn.grid.test.pred.class <- predict(m.nn.grid.train, isc.test) #predict classes with default .5 cutoff
+
+#draw ROC curve of training and test performance of all models
+library(pROC)
+jpeg("plot.jpg")
+par(mfrow=c(2,1))
+
+log.test.roc<- roc(response= isc.test$stroke, predictor=log.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(log.test.roc, legacy.axes=T)
+plot(log.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Logit")
+
+lda.test.roc<- roc(response= isc.test$stroke, predictor=lda.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(lda.test.roc, legacy.axes=T)
+plot(lda.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="LDA")
+
+dev.off()
+jpeg("plot2.jpg")
+par(mfrow=c(2,1))
+
+qda.test.roc<- roc(response= isc.test$stroke, predictor=qda.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(qda.test.roc, legacy.axes=T)
+plot(qda.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"), title="qda",lty=1)
+
+knn.test.roc<- roc(response= isc.test$stroke, predictor=knn.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(knn.test.roc, legacy.axes=T)
+plot(knn.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"), title="KNN",lty=1)
+
+dev.off()
+jpeg("plot3.jpg")
+par(mfrow=c(2,1))
+
+gamSp.test.roc<- roc(response= isc.test$stroke, predictor=gamSp.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(gamSp.test.roc, legacy.axes=T)
+plot(gamSp.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"), title="gamSp",lty=1)
+
+tree.test.roc<- roc(response= isc.test$stroke, predictor=tree.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(tree.test.roc, legacy.axes=T)
+plot(tree.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Tree")
+
+dev.off()
+jpeg("plot4.jpg")
+par(mfrow=c(2,1))
+
+bag.test.roc<- roc(response= isc.test$stroke, predictor=bag.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(bag.test.roc, legacy.axes=T)
+plot(bag.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Bagging Tree")
+
+rf.test.roc<- roc(response= isc.test$stroke, predictor=rf.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(rf.test.roc, legacy.axes=T)
+plot(rf.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Random Forest")
+
+dev.off()
+jpeg("plot5.jpg")
+par(mfrow=c(1,1))
+
+boost.test.roc<- roc(response= isc.test$stroke, predictor=boost.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(boost.test.roc, legacy.axes=T)
+plot(boost.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Boosting")
+
+dev.off()
+
+jpeg("plot5.jpg")
+par(mfrow=c(2,1))
+
+nn.test.roc<- roc(response= isc.test$stroke, predictor=nn.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(nn.test.roc, legacy.axes=T)
+plot(nn.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Neural Network")
+
+m.nn.grid.test.roc<- roc(response= isc.test$stroke, predictor=m.nn.grid.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+plot(m.nn.grid.test.roc, legacy.axes=T)
+plot(m.nn.grid.train.roc, add=T, col="blue")
+legend(x=.2, y=.7, legend=c("Test", "Train"), col=c("black", "blue"),lty=1, title="Grid Neural Network")
+dev.off()
+
+#Test performance
+
+log.perf <- confusionMatrix(log.test.pred.class, isc.test$stroke)$byClass[1:2]
+lda.perf <- confusionMatrix(lda.test.pred.class, isc.test$stroke)$byClass[1:2]
+qda.perf <- confusionMatrix(qda.test.pred.class, isc.test$stroke)$byClass[1:2]
+knn.perf <- confusionMatrix(knn.test.pred.class, isc.test$stroke)$byClass[1:2]
+gamSp.perf <- confusionMatrix(gamSp.test.pred.class, isc.test$stroke)$byClass[1:2]
+tree.perf <- confusionMatrix(tree.test.pred.class, isc.test$stroke)$byClass[1:2]
+bag.perf <- confusionMatrix(bag.test.pred.class, isc.test$stroke)$byClass[1:2]
+rf.perf <- confusionMatrix(rf.test.pred.class, isc.test$stroke)$byClass[1:2]
+boost.perf <- confusionMatrix(boost.test.pred.class, isc.test$stroke)$byClass[1:2]
+nn.perf <- confusionMatrix(nn.test.pred.class, isc.test$stroke)$byClass[1:2]
+m.nn.grid.perf <- confusionMatrix(m.nn.grid.test.pred.class, isc.test$stroke)$byClass[1:2]
+
+log.perf <- c(log.perf,auc(log.test.roc))
+lda.perf <- c(lda.perf,auc(lda.test.roc))
+qda.perf <- c(qda.perf,auc(qda.test.roc))
+knn.perf <- c(knn.perf,auc(knn.test.roc))
+gamSp.perf <- c(gamSp.perf,auc(gamSp.test.roc))
+tree.perf <- c(tree.perf,auc(tree.test.roc))
+bag.perf <- c(bag.perf,auc(bag.test.roc))
+rf.perf <- c(rf.perf,auc(rf.test.roc))
+boost.perf <- c(boost.perf,auc(boost.test.roc))
+nn.perf <- c(nn.perf,auc(nn.test.roc))
+m.nn.grid.perf <- c(m.nn.grid.perf,auc(m.nn.grid.test.roc))
+
+write.table(log.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(lda.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(qda.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(knn.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(gamSp.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(tree.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(bag.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(rf.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(boost.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(nn.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+write.table(m.nn.grid.perf, file = "TestPerf.csv", append = TRUE, sep=",")
+
+auc(log.train.roc)
+auc(log.test.roc)
+
+auc(lda.test.roc)
+auc(lda.train.roc)
+
+auc(qda.test.roc)
+auc(qda.train.roc)
+
+auc(knn.test.roc)
+auc(knn.train.roc)
+
+auc(gamSp.test.roc)
+auc(gamSp.train.roc)
+
+auc(tree.test.roc)
+auc(tree.train.roc)
+
+auc(bag.test.roc)
+auc(bag.train.roc)
+
+auc(rf.test.roc)
+auc(rf.train.roc)
+
+auc(boost.test.roc)
+auc(boost.train.roc)
+
+auc(nn.test.roc)
+auc(nn.train.roc)
+
+auc(m.nn.grid.test.roc)
+auc(m.nn.grid.train.roc)
+
+#LDA is the best model
+##Tuning LDA
+set.seed(199)
+tune.lda.train <-  train(stroke ~ ., data=ischemic.d, method="lda", metric="ROC", trControl=ctrl)
+tune.lda.train
+varImp(tune.lda.train)
+tune.lda.test.pred.prob <- predict(tune.lda.train, isc.test, type="prob")
+tune.lda.test.pred.class <- predict(tune.lda.train, isc.test) #predict classes with default .5 cutoff
+tune.lda.test.roc<- roc(response= isc.test$stroke, predictor=tune.lda.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+tune.lda.test.roc
+tune.lda.test.pred.prob
+
+#extract threshold from roc curve  get threshold at coordinates top left most corner
+tune.lda.test.Thresh<- coords(tune.lda.test.roc, x="best", best.method="closest.topleft")
+tune.lda.test.Thresh
+#lets make new predictions with this cut-off and recalculate confusion matrix
+
+test.pred.class.newpreds <- factor(ifelse(tune.lda.train$pred$Yes > tune.lda.test.Thresh[1], "Yes", "No"))
+confusionMatrix(test.pred.class.newpreds, tune.lda.train$pred$obs)
+
+# look at TPR and TNR distribution over threshold
+matplot(data.frame(tune.lda.test.roc$sensitivities, tune.lda.test.roc$specificities), x = tune.lda.test.roc$thresholds, type='l', xlab = 'threshold', ylab='TPR, TNR')
+legend('bottomright', legend=c('TNR', 'TPR'), lty=1:2, col=1:2)
+
+#Tuning threshold
+
+x <- seq(from =.0, to=1, by=.005)
+
+length(x)
+FP <- seq(from =1, to=length(x), by=1)
+FN <- seq(from =1, to=length(x), by=1)
+y <- 1
+for (y in 1:length(x)){
+  test.pred.class.newthresh <- factor(ifelse(tune.lda.test.pred.prob[[1]] > x[y],"Yes","No"))
+  FP[y] <- 1-confusionMatrix(test.pred.class.newthresh, isc.test$stroke)$byClass[2]
+  FN[y] <- 1-confusionMatrix(test.pred.class.newthresh, isc.test$stroke)$byClass[1]
+}
+confusionMatrix(test.pred.class.newthresh, isc.test$stroke)$byClass[1]
+confusionMatrix(test.pred.class.newthresh, isc.test$stroke)$byClass[2]
+
+x[24]
+test.pred.class.newthresh <- factor(ifelse(tune.lda.test.pred.prob[[1]] > x[24],"Yes","No"))
+confusionMatrix(test.pred.class.newthresh, isc.test$stroke)
+
+write.table(FP, file = "FPFN.csv", append = TRUE, sep=",")
+write.table(FN, file = "FPFN.csv", append = TRUE, sep=",")
+write.table(x, file = "FPFN.csv", append = TRUE, sep=",")
+
+
+##Tuning random forest
+tune.rf.test.pred.prob <- predict(rf.train, isc.test, type="prob")
+tune.rf.test.pred.class <- predict(rf.train, isc.test) #predict classes with default .5 cutoff
+tune.rf.test.roc<- roc(response= isc.test$stroke, predictor=tune.rf.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+
+# look at TPR and TNR distribution over threshold
+matplot(data.frame(rf.test.roc$sensitivities, rf.test.roc$specificities), x = rf.test.roc$thresholds, type='l', xlab = 'threshold', ylab='TPR, TNR')
+legend('bottomright', legend=c('TNR', 'TPR'), lty=1:2, col=1:2)
+
+x <- seq(from =.0, to=1, by=.005)
+length(x)
+FP.rf <- seq(from =1, to=length(x), by=1)
+FN.rf <- seq(from =1, to=length(x), by=1)
+y <- 1
+for (y in 1:length(x)){
+  rf.test.pred.class.newthresh <- factor(ifelse(tune.rf.test.pred.prob[[1]] > x[y],"Yes","No"))
+  FP.rf[y] <- 1-confusionMatrix(rf.test.pred.class.newthresh, isc.test$stroke)$byClass[2]
+  FN.rf[y] <- 1-confusionMatrix(rf.test.pred.class.newthresh, isc.test$stroke)$byClass[1]
+}
+
+write.table(FP.rf, file = "FPFN_RF.csv", append = TRUE, sep=",")
+write.table(FN.rf, file = "FPFN_RF.csv", append = TRUE, sep=",")
+write.table(x, file = "FPFN_RF.csv", append = TRUE, sep=",")
+
+
+
+##Tuning GamSpline
+tune.gamSp.test.pred.prob <- predict(gamSp.train, isc.test, type="prob")
+tune.gamSp.test.pred.class <- predict(gamSp.train, isc.test) #predict classes with default .5 cutoff
+tune.gamSp.test.roc<- roc(response= isc.test$stroke, predictor=tune.gamSp.test.pred.prob[[1]]) #assumes postive class Yes is reference level
+
+# look at TPR and TNR distribution over threshold
+matplot(data.frame(gamSp.test.roc$sensitivities, gamSp.test.roc$specificities), x = gamSp.test.roc$thresholds, type='l', xlab = 'threshold', ylab='TPR, TNR')
+legend('bottomright', legend=c('TNR', 'TPR'), lty=1:2, col=1:2)
+
+x <- seq(from =.0, to=1, by=.005)
+length(x)
+FP.gamSp <- seq(from =1, to=length(x), by=1)
+FN.gamSp <- seq(from =1, to=length(x), by=1)
+y <- 1
+for (y in 1:length(x)){
+  gamSp.test.pred.class.newthresh <- factor(ifelse(tune.gamSp.test.pred.prob[[1]] > x[y],"Yes","No"))
+  FP.gamSp[y] <- 1-confusionMatrix(gamSp.test.pred.class.newthresh, isc.test$stroke)$byClass[2]
+  FN.gamSp[y] <- 1-confusionMatrix(gamSp.test.pred.class.newthresh, isc.test$stroke)$byClass[1]
+}
+
+write.table(FP.gamSp, file = "FPFN_gamSp.csv", append = TRUE, sep=",")
+write.table(FN.gamSp, file = "FPFN_gamSp.csv", append = TRUE, sep=",")
+write.table(x, file = "FPFN_gamSp.csv", append = TRUE, sep=",")
+
+
+
+
+RValues <- resamples(list(nn=m.nn, nn.grid=m.nn.grid))
+
+summary(RValues)
+
+#create plot comparing them
+bwplot(RValues, metric="ROC")
+bwplot(RValues, metric="Sens") #Sensitvity
+bwplot(RValues, metric="Spec")
+
+#making predictions, confusion matrix
+confusionMatrix(predict(m.nn.grid,isc.test), isc.test$stroke)
+
+summary(log.train)
+
+stopCluster(cl)
+################################################BONUS NEURAL NETWORKS#############################################################
+
+
+library('doParallel')
+
+detectCores(logical = FALSE)
+cl <- makePSOCKcluster(4)
+clusterSetRNGStream(cl, 5672) #set seed for everymember of cluster
+registerDoParallel(cl)
+
+#list number of workers
+getDoParWorkers()
+
+library(caret)
+ctrl <- trainControl(method = "cv", number=10,
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary,
+                     allowParallel = TRUE)
+modelLookup("nnet")
+
+m.nn <- train(stroke ~ ., trControl = ctrl, data = ischemic.d, metric ='ROC',
+              method = "nnet") #it runned 10 times, ut you can modify that number
+plot(m.nn) #1,3, and 5 hidden nodes
+getTrainPerf(m.nn)
+m.nn
+#Creating a new grid within range of size (5,10,15) using different decay rate
+nn.grid <- expand.grid(size=c(seq(1,13,1)), decay=c(0,.001, .01))
+
+m.nn.grid <- train(stroke ~ ., trControl = ctrl, data = ischemic.d, metric ='ROC',
+                   tuneGrid=nn.grid, method = "nnet")
+
+m.nn.grid
+plot(m.nn.grid)
+getTrainPerf(m.nn.grid)
+
+RValues <- resamples(list(nn=m.nn, nn.grid=m.nn.grid))
+
+summary(RValues)
+
+#create plot comparing them
+bwplot(RValues, metric="ROC")
+bwplot(RValues, metric="Sens") #Sensitvity
+bwplot(RValues, metric="Spec")
+
+#making predictions, confusion matrix
+confusionMatrix(predict(m.nn.grid,isc.test), isc.test$stroke) 
+
+
+stopCluster(cl)
+
+
+
+
